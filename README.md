@@ -124,6 +124,7 @@ docker compose exec api sh -c "cd /repo/packages/database && node_modules/.bin/p
 
 - Design and feature notes: `DHARMA_EVENTS_REQUIREMENTS_AND_DESIGN.md`
 - Quickstart: `docs/QUICKSTART.md`
+- User guide: `docs/USER_GUIDE.md`
 - Architecture: `docs/ARCHITECTURE.md`
 - Deployment notes: `docs/SYNOLOGY_DEPLOYMENT.md`
 - Implementation status and diagrams: `docs/IMPLEMENTATION_STATUS.md`
