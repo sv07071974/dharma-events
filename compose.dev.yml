@@ -1,0 +1,24 @@
+name: dharma-events-dev
+
+# Development overlay: run only PostgreSQL in Docker; run web/api/worker
+# locally via `pnpm dev:*` for fast iteration and hot reload.
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-dharma_events}
+      POSTGRES_USER: ${POSTGRES_USER:-dharma_events}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-dharma_events_dev}
+    ports:
+      - "127.0.0.1:5432:5432"
+    volumes:
+      - postgres-dev-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+volumes:
+  postgres-dev-data:

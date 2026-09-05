@@ -1,0 +1,84 @@
+name: dharma-events
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-dharma_events}
+      POSTGRES_USER: ${POSTGRES_USER:-dharma_events}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      # The official image defaults to UTC regardless of the Docker host's
+      # time zone, but this is set explicitly so it survives an image swap
+      # or base-image change (see packages/database/src/test-db.ts for the
+      # same UTC requirement in tests, and docs/ASSUMPTIONS.md).
+      TZ: UTC
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal
+    # No `ports:` mapping - PostgreSQL must never be reachable from outside the
+    # Docker network (see REQUIREMENTS.md Section 36 - Security Requirements).
+
+  api:
+    build:
+      context: .
+      dockerfile: docker/api.Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://localhost:3000/api/ready"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - internal
+
+  worker:
+    build:
+      context: .
+      dockerfile: docker/worker.Dockerfile
+    restart: unless-stopped
+    env_file:
+      - .env
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      # The worker has no HTTP listener (it's a background poller - see
+      # apps/worker/src/index.ts), so liveness is checked by confirming its
+      # Node process is still running rather than probing a port.
+      test: ["CMD-SHELL", "ps aux | grep '[d]ist/index.js' || exit 1"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+    networks:
+      - internal
+
+  web:
+    build:
+      context: .
+      dockerfile: docker/web.Dockerfile
+    restart: unless-stopped
+    depends_on:
+      - api
+    ports:
+      - "8088:80"
+    networks:
+      - internal
+
+networks:
+  internal:
+    driver: bridge
+
+volumes:
+  postgres-data:

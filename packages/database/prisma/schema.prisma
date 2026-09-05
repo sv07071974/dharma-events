@@ -1,0 +1,319 @@
+// Dharma Events database schema.
+//
+// Phase 0 (Repository Bootstrap) wired up the PostgreSQL datasource and
+// Prisma client generator.
+//
+// Phase 1 (Database and Authentication) introduced Users, Sessions and
+// AuditLog - see REQUIREMENTS.md Section 75 and Section 12 (Database Design).
+//
+// Phase 2 (Event Management) introduces Event, Category and Volunteer - see
+// REQUIREMENTS.md Section 76 and Section 12.2-12.4.
+//
+// Phase 3 (Registration Management) introduces Registration - see
+// REQUIREMENTS.md Section 77 and Section 12.5. QR/check-in domain models
+// land in later phases.
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum Role {
+  ADMIN
+  EVENT_MANAGER
+  SUPERVISOR
+  VOLUNTEER
+}
+
+/// REQUIREMENTS.md Section 12.2 - suggested event statuses.
+enum EventStatus {
+  DRAFT
+  ACTIVE
+  COMPLETED
+  ARCHIVED
+}
+
+/// REQUIREMENTS.md Section 12.5 - registration invitation status. No literal
+/// enum values are given for this column in the spec (only invitation_jobs
+/// has documented statuses); NOT_SENT/PENDING/SENT/FAILED mirrors the
+/// invitation_jobs lifecycle at the registration level (see
+/// docs/ASSUMPTIONS.md).
+enum InvitationStatus {
+  NOT_SENT
+  PENDING
+  SENT
+  FAILED
+}
+
+/// REQUIREMENTS.md Section 12.5 / Section 17 - import preview buckets rows
+/// into Valid/Warning/Error; used as the registration's data validation
+/// status.
+enum ValidationStatus {
+  VALID
+  WARNING
+  ERROR
+}
+
+/// REQUIREMENTS.md Section 12.7 - invitation_jobs. Statuses per the spec's
+/// literal list (PENDING/PROCESSING/SENT/FAILED/CANCELLED).
+enum InvitationJobStatus {
+  PENDING
+  PROCESSING
+  SENT
+  FAILED
+  CANCELLED
+}
+
+/// REQUIREMENTS.md Section 12.6 - checkins. Statuses per the spec's
+/// "suggested statuses" list. VALID is a normal volunteer check-in,
+/// OVERRIDE is a supervisor-approved check-in that exceeded the remaining
+/// count (Phase 6), REVERSED marks a checkin transaction as undone without
+/// deleting it (preserving the immutable audit trail - Section 12.6 "Never
+/// use only a checked_in = true field as the source of truth").
+enum CheckinStatus {
+  VALID
+  OVERRIDE
+  REVERSED
+}
+
+/// REQUIREMENTS.md Section 12.1 - users
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  name         String
+  role         Role
+  active       Boolean  @default(true)
+  createdAt    DateTime @default(now()) @map("created_at")
+  updatedAt    DateTime @updatedAt @map("updated_at")
+
+  sessions   Session[]
+  auditLogs  AuditLog[]
+  volunteers Volunteer[]
+  checkins   Checkin[]
+
+  @@map("users")
+}
+
+/// Server-side session store backing the auth session cookie. Only a hash of
+/// the session token is stored, mirroring the QR token security design in
+/// REQUIREMENTS.md Section 13.
+model Session {
+  id        String   @id @default(uuid())
+  tokenHash String   @unique @map("token_hash")
+  userId    String   @map("user_id")
+  expiresAt DateTime @map("expires_at")
+  createdAt DateTime @default(now()) @map("created_at")
+  ipAddress String?  @map("ip_address")
+  userAgent String?  @map("user_agent")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@map("sessions")
+}
+
+/// REQUIREMENTS.md Section 12.2 - events
+model Event {
+  id               String      @id @default(uuid())
+  eventCode        String      @unique @map("event_code")
+  eventName        String      @map("event_name")
+  description      String?
+  eventDate        DateTime    @map("event_date") @db.Date
+  venue            String?
+  status           EventStatus @default(DRAFT)
+  registrationOpen Boolean     @default(false) @map("registration_open")
+  checkinOpen      Boolean     @default(false) @map("checkin_open")
+  // Monotonically increasing counter used to atomically generate
+  // registration numbers such as "MDF26-0001" (Section 6). Incremented via
+  // a single-row UPDATE inside the import transaction, which Postgres
+  // serializes per-row - see docs/ASSUMPTIONS.md.
+  registrationSeq  Int         @default(0) @map("registration_seq")
+  // Optional PDF (flyer/brochure/formal invite letter) attached once per
+  // event and appended after each participant's generated ticket PDF when
+  // invitation emails are sent (see InvitationEmail/Section 19). Stored
+  // directly in Postgres (rather than on disk) so the api and worker
+  // containers never need a shared filesystem volume - see docs/ASSUMPTIONS.md.
+  inviteAttachmentData     Bytes?    @map("invite_attachment_data")
+  inviteAttachmentFilename String?   @map("invite_attachment_filename")
+  inviteAttachmentSize     Int?      @map("invite_attachment_size")
+  createdAt        DateTime    @default(now()) @map("created_at")
+  updatedAt        DateTime    @updatedAt @map("updated_at")
+
+  categories     Category[]
+  volunteers     Volunteer[]
+  registrations  Registration[]
+  auditLogs      AuditLog[]
+  invitationJobs InvitationJob[]
+  checkins       Checkin[]
+
+  @@map("events")
+}
+
+/// REQUIREMENTS.md Section 12.3 - categories (configurable per event).
+model Category {
+  id          String   @id @default(uuid())
+  eventId     String   @map("event_id")
+  name        String
+  description String?
+  active      Boolean  @default(true)
+  sortOrder   Int      @default(0) @map("sort_order")
+  // Optional category-specific invite PDF (e.g. a distinct template for
+  // "VIP" vs "General"), appended after the ticket page in place of the
+  // event's common `inviteAttachmentData` when present - see
+  // apps/worker/src/invitation-worker.ts for the selection logic. Added
+  // this session alongside the volunteer-CC and per-guest-QR features
+  // (not in the original REQUIREMENTS.md spec).
+  inviteAttachmentData     Bytes?   @map("invite_attachment_data")
+  inviteAttachmentFilename String?  @map("invite_attachment_filename")
+  inviteAttachmentSize     Int?     @map("invite_attachment_size")
+  createdAt   DateTime @default(now()) @map("created_at")
+  updatedAt   DateTime @updatedAt @map("updated_at")
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+
+  registrations Registration[]
+
+  @@unique([eventId, name])
+  @@index([eventId])
+  @@map("categories")
+}
+
+/// REQUIREMENTS.md Section 12.4 - volunteers (per event; optionally linked to
+/// a login-capable User).
+model Volunteer {
+  id        String   @id @default(uuid())
+  eventId   String   @map("event_id")
+  userId    String?  @map("user_id")
+  name      String
+  email     String
+  phone     String?
+  role      String
+  active    Boolean  @default(true)
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  event Event @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  user  User? @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  registrations Registration[]
+
+  @@index([eventId])
+  @@index([userId])
+  @@map("volunteers")
+}
+
+/// REQUIREMENTS.md Section 12.5 - registrations. Email uniqueness is
+/// deliberately NOT enforced (families/legitimate duplicates may exist);
+/// only (event_id, registration_no) is unique.
+model Registration {
+  id               String           @id @default(uuid())
+  eventId          String           @map("event_id")
+  registrationNo   String           @map("registration_no")
+  sourceTimestamp  DateTime?        @map("source_timestamp")
+  name             String
+  email            String
+  phone            String?
+  registeredCount  Int              @map("registered_count")
+  categoryId       String           @map("category_id")
+  volunteerId      String?          @map("volunteer_id")
+  qrTokenHash      String?          @map("qr_token_hash")
+  invitationStatus InvitationStatus @default(NOT_SENT) @map("invitation_status")
+  invitationSentAt DateTime?        @map("invitation_sent_at")
+  validationStatus ValidationStatus @default(VALID) @map("validation_status")
+  duplicateFlag    Boolean          @default(false) @map("duplicate_flag")
+  notes            String?
+  createdAt        DateTime         @default(now()) @map("created_at")
+  updatedAt        DateTime         @updatedAt @map("updated_at")
+
+  event          Event           @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  category       Category        @relation(fields: [categoryId], references: [id])
+  volunteer      Volunteer?      @relation(fields: [volunteerId], references: [id], onDelete: SetNull)
+  invitationJobs InvitationJob[]
+  checkins       Checkin[]
+
+  @@unique([eventId, registrationNo])
+  @@index([eventId])
+  @@index([categoryId])
+  @@index([volunteerId])
+  @@index([email])
+  @@map("registrations")
+}
+
+/// REQUIREMENTS.md Section 12.7 - invitation_jobs. `nextAttemptAt` is an
+/// addition beyond the spec's literal column list (see
+/// docs/ASSUMPTIONS.md) used to schedule the Section 21 backoff retry
+/// policy (immediate / +1m / +5m / +30m) without a separate scheduler.
+model InvitationJob {
+  id             String              @id @default(uuid())
+  eventId        String              @map("event_id")
+  registrationId String              @map("registration_id")
+  status         InvitationJobStatus @default(PENDING)
+  attemptCount   Int                 @default(0) @map("attempt_count")
+  lastAttemptAt  DateTime?           @map("last_attempt_at")
+  nextAttemptAt  DateTime?           @map("next_attempt_at")
+  sentAt         DateTime?           @map("sent_at")
+  errorMessage   String?             @map("error_message")
+  createdAt      DateTime            @default(now()) @map("created_at")
+  updatedAt      DateTime            @updatedAt @map("updated_at")
+
+  event        Event        @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  registration Registration @relation(fields: [registrationId], references: [id], onDelete: Cascade)
+
+  @@index([eventId])
+  @@index([registrationId])
+  @@index([status])
+  @@map("invitation_jobs")
+}
+
+/// REQUIREMENTS.md Section 12.6 - checkins. Every check-in (and reversal) is
+/// stored as its own immutable transaction row; the running "checked in"
+/// total is always computed by summing VALID/OVERRIDE rows minus REVERSED
+/// ones (Section 50), never read off a mutable boolean/counter field.
+model Checkin {
+  id             String        @id @default(uuid())
+  eventId        String        @map("event_id")
+  registrationId String        @map("registration_id")
+  attendeeCount  Int           @map("attendee_count")
+  checkedInAt    DateTime      @default(now()) @map("checked_in_at")
+  checkedById    String        @map("checked_in_by")
+  counterName    String?       @map("counter_name")
+  deviceId       String?       @map("device_id")
+  status         CheckinStatus @default(VALID)
+  notes          String?
+  createdAt      DateTime      @default(now()) @map("created_at")
+
+  event        Event        @relation(fields: [eventId], references: [id], onDelete: Cascade)
+  registration Registration @relation(fields: [registrationId], references: [id], onDelete: Cascade)
+  checkedBy    User         @relation(fields: [checkedById], references: [id])
+
+  @@index([eventId])
+  @@index([registrationId])
+  @@index([status])
+  @@map("checkins")
+}
+
+/// REQUIREMENTS.md Section 12.8 - audit_logs (append-only from the app layer).
+model AuditLog {
+  id         String   @id @default(uuid())
+  eventId    String?  @map("event_id")
+  userId     String?  @map("user_id")
+  action     String
+  entityType String?  @map("entity_type")
+  entityId   String?  @map("entity_id")
+  metadata   Json?
+  ipAddress  String?  @map("ip_address")
+  createdAt  DateTime @default(now()) @map("created_at")
+
+  event Event? @relation(fields: [eventId], references: [id], onDelete: SetNull)
+  user  User?  @relation(fields: [userId], references: [id], onDelete: SetNull)
+
+  @@index([userId])
+  @@index([eventId])
+  @@index([action])
+  @@map("audit_logs")
+}
