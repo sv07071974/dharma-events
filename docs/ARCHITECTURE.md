@@ -1,36 +1,82 @@
-Dharma Events — Architecture Overview
+# Dharma Events — Architecture
 
-Summary
-- Monorepo (pnpm workspace) containing:
-  - apps/api — Fastify server, Prisma DB access, authentication, import, reporting
-  - apps/web — React (Vite), TanStack Query, UI routes
-  - apps/worker — background jobs: invitation processing, mailer, retries
-  - packages/database — Prisma schema, migrations, client wrapper
-  - packages/shared — shared utilities: env loader, QR token, PDF helpers
+This document provides a technical view of runtime components, data flow, and operational hotspots.
 
-Key design decisions
-- Single Postgres database for all app data; Prisma manages schema and migrations.
-- Invitation PDFs and per-event/category invite attachments stored as bytea in Postgres to avoid a shared filesystem between api and worker.
-- Immutable audit log and checkin transaction rows to ensure an auditable history.
-- Background jobs implemented in a worker process and scheduled via job rows (invitation_jobs) with nextAttemptAt + backoff.
+## 1. Workspace layout
 
-Hotspots & operational notes
-- DB growth: storing PDFs in Postgres can bloat backups. Consider object storage (S3/GCS) if attachment volume grows.
-- Native module builds: @node-rs/argon2 and similar require CI builders per-target. Use matrix builds or prebuilt binaries.
-- Security: ensure production release uses HTTPS, secure cookie flags (SameSite, Secure, HttpOnly), and strict CORS.
+| Area | Path | Purpose |
+|---|---|---|
+| API | `apps/api` | Fastify HTTP API, auth, imports, check-ins, reports |
+| Web | `apps/web` | React SPA (Vite), operator UI, scanner flow |
+| Worker | `apps/worker` | Invitation queue processing, retries, email sends |
+| Database package | `packages/database` | Prisma schema, migrations, generated client |
+| Shared package | `packages/shared` | Env validation, QR/token, PDF/email helper logic |
 
-Simple ASCII diagram
+## 2. System context
 
-  [Browser] <---> [Web (Vite / Nginx)] <---> [API (Fastify)] <---> [Postgres]
-                                 \
-                                  --> [Worker]
+```mermaid
+flowchart LR
+    U[Users / Operators] --> W[Web UI\nReact + Vite + Nginx]
+    W -->|HTTPS + Cookie Session| A[API\nFastify]
+    A -->|Prisma| P[(PostgreSQL)]
+    A -->|Create invitation_jobs| P
+    K[Worker] -->|Poll pending jobs| P
+    K -->|SMTP / Mail API| M[Email Provider]
+    K -->|Update status + attempts| P
+```
 
-- Browser: UI, authentication, and check-in scanner
-- Web: serves SPA and proxies /api to Fastify
-- API: business logic, auth, uploads, audit logging
-- Worker: processes invitation_jobs, sends email attachments
+## 3. Core domain model
 
-Recommended next steps
-- Add monitoring/metrics (Prometheus + Grafana) for DB size, job queue latency, and mailer errors.
-- Add retention/archival policy for invite attachments and old events.
-- Add deployment manifests and an infra README (Helm / Docker Compose examples already in repo).
+```mermaid
+erDiagram
+    USER ||--o{ SESSION : has
+    USER ||--o{ AUDIT_LOG : writes
+    EVENT ||--o{ CATEGORY : contains
+    EVENT ||--o{ VOLUNTEER : assigns
+    EVENT ||--o{ REGISTRATION : receives
+    REGISTRATION ||--o{ INVITATION_JOB : queues
+    REGISTRATION ||--o{ CHECKIN : records
+    USER ||--o{ CHECKIN : performs
+```
+
+## 4. Invitation processing flow
+
+```mermaid
+sequenceDiagram
+    participant UI as Web UI
+    participant API as API (Fastify)
+    participant DB as PostgreSQL
+    participant WRK as Worker
+    participant MAIL as Email Provider
+
+    UI->>API: Trigger invitation send
+    API->>DB: Insert invitation_jobs (PENDING)
+    WRK->>DB: Poll due jobs (PENDING/FAILED + nextAttemptAt)
+    WRK->>MAIL: Send email + PDF attachments
+    alt success
+        WRK->>DB: Mark SENT, set sentAt
+    else failure
+        WRK->>DB: Mark FAILED, increment attemptCount,\nset nextAttemptAt (backoff)
+    end
+```
+
+## 5. Design choices and implications
+
+1. **Single Postgres source of truth**: all operational data is persisted in one relational store with Prisma migrations.
+2. **Attachments in database (`bytea`)**: simplifies deployment (no shared volume) but increases backup size and restore time.
+3. **Immutable check-in and audit rows**: preserves history and supports compliance/auditability.
+4. **Dedicated worker for async tasks**: avoids blocking request/response flows and enables retry policies.
+
+## 6. Hotspots to monitor
+
+1. **Storage growth**: binary invite attachments can grow `events/categories` row size and total DB footprint.
+2. **Job latency**: watch backlog and retry rate in `invitation_jobs` to detect mailer degradation.
+3. **Security posture**: enforce HTTPS and secure cookie/session settings in production.
+4. **Native dependencies in CI/CD**: ensure target-compatible builds for native modules (e.g., argon2 bindings).
+
+## 7. Related docs
+
+- `docs/QUICKSTART.md`
+- `docs/SYNOLOGY_DEPLOYMENT.md`
+- `docs/IMPLEMENTATION_STATUS.md`
+- `DHARMA_EVENTS_REQUIREMENTS_AND_DESIGN.md`
